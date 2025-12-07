@@ -1,0 +1,377 @@
+from turtle import forward
+from einops import rearrange
+import torch
+import torch.nn as nn
+# from timm.models.layers import DropPath
+
+
+class Conv3x3(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+# class MHCA(nn.Module):
+#     """
+#     Multi-Head Convolutional Attention (MHCA)
+#     Uniformly set head dim to 32 in all MHCA for fast inference
+#     speed with various date-type on TensorRT.
+#
+#     Parameters
+#     ----------
+#     channel : int
+#         Number of channels.
+#     groups : int
+#         Number of groups.
+#     """
+#     def __init__(self, channel):
+#         super(MHCA, self).__init__()
+#         self.grouped_conv = nn.Conv2d(channel, channel, kernel_size = 3, padding = 1, groups = channel // 32)
+#         self.relu = nn.ReLU(inplace = True)
+#         self.point_conv = nn.Conv2d(channel, channel, kernel_size = 1)
+#
+#     def forward(self, x):
+#         return self.point_conv(self.relu(self.grouped_conv(x)))
+
+
+class MHCA(nn.Module):
+    def __init__(self, dim, ffn_expansion_factor=0.5, bias=False):
+        super(MHCA, self).__init__()
+
+        hidden_features = int(dim * ffn_expansion_factor)
+
+        self.project_in = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+
+        self.dwconv3x3 = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1, groups=hidden_features, bias=bias)
+        self.dwconv5x5 = nn.Conv2d(hidden_features, hidden_features, kernel_size=5, stride=1, padding=2, groups=hidden_features, bias=bias)
+        self.relu3 = nn.ReLU()
+        self.relu5 = nn.ReLU()
+
+        self.dwconv3x3_1 = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1, groups=hidden_features , bias=bias)
+        self.dwconv5x5_1 = nn.Conv2d(hidden_features, hidden_features, kernel_size=5, stride=1, padding=2, groups=hidden_features , bias=bias)
+
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        x = self.project_in(x)
+        x1, x2 = x.chunk(2, dim=1)
+        x1_3 = self.relu3(self.dwconv3x3(x1))
+        x2_5 = self.relu5(self.dwconv5x5(x2))
+
+        x1 = self.dwconv3x3_1(x1_3)
+        x2 = self.dwconv5x5_1(x2_5)
+
+        x = torch.cat([x1, x2], dim=1)
+
+        x = self.project_out(x)
+
+        return x
+
+
+class Mlp(nn.Module):
+    """
+    Multi layer perceptron with dropout.
+    Paper: https://arxiv.org/abs/2111.11418
+    """
+    def __init__(self, in_features, out_features, expansion_ratio = 1):
+        super().__init__()
+        hidden_feature = in_features * expansion_ratio
+        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = nn.Conv2d(in_features, hidden_feature, kernel_size = 1)
+        self.conv2 = nn.Conv2d(hidden_feature, out_features, kernel_size = 1)
+
+    def forward(self, x):
+        return self.conv2(self.relu(self.conv1(x)))
+
+
+class NCB(nn.Module):
+    """
+    Next-Convolution Block (NCB)
+    Parameters
+    ----------
+    channel : int
+        Number of channels.
+    """
+    def __init__(self, channel):
+        super().__init__()
+        self.mhca = MHCA(channel)
+        self.mlp = Mlp(channel, channel, expansion_ratio=3)
+
+    def forward(self, x):
+        x = self.mhca(x) + x
+        x = self.mlp(x) + x
+        return x
+
+
+class E_MHSA(nn.Module):
+    """
+    Effecient Multi-Head Self-Attention (E-MHSA)
+    Parameters
+    ----------
+    dim : int
+        Number of input channels.
+    heads : int
+        Number of heads.
+    inner_dim : int
+        Number of hidden channels for each head.
+    dropout : float
+        Dropout rate.
+    stride : int
+        Stride of the convolutional block.
+    """
+    def __init__(self, dim, heads=8, inner_dim=64, stride = 2):
+        super().__init__()
+        self.dim = dim
+        self.inner_dim = inner_dim
+        self.heads = heads
+        self.scaled_factor = inner_dim ** -0.5
+
+        self.avg_pool = nn.AvgPool2d(stride, stride = stride)
+
+        self.fc_q = nn.Linear(dim, self.inner_dim * self.heads)
+        self.fc_k = nn.Linear(dim, self.inner_dim * self.heads)
+        self.fc_v = nn.Linear(dim, self.inner_dim * self.heads)
+        self.fc_o = nn.Linear(self.inner_dim * self.heads, dim)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+
+        x_reshape = x.view(b, c, h * w).permute(0, 2, 1)  # [b, h * w, c]
+
+         # Get q, k, v
+        q = self.fc_q(x_reshape)
+        # [b, heads, h * w, inner_dim]
+        q = q.view(b, h * w, self.heads, self.inner_dim).permute(0, 2, 1, 3).contiguous()
+
+        k = self.fc_k(x_reshape)
+        k = k.view(b, self.heads * self.inner_dim, h, w)
+        k = self.avg_pool(k)
+        # [b, heads, h * w, inner_dim]
+        k = rearrange(k, "b (head n) h w -> b head (h w) n", head = self.heads)
+
+        v = self.fc_v(x_reshape)
+        v = v.view(b, self.heads * self.inner_dim, h, w)
+        v = self.avg_pool(v)
+        # [b, heads, h * w, inner_dim]
+        v = rearrange(v, "b (head n) h w -> b head (h w) n", head = self.heads)
+
+        # Attention
+        attn = torch.einsum('... i d, ... j d -> ... i j', q, k) * self.scaled_factor
+        attn = torch.softmax(attn, dim = -1) # [b, heads, h * w, s_h * s_w], s_h = s_h // stride
+
+        result = torch.matmul(attn, v).permute(0, 2, 1, 3)
+        result = result.contiguous().view(b, h * w, self.heads * self.inner_dim)
+        result = self.fc_o(result).view(b, self.dim, h, w)
+        result = result + x
+        return result
+
+
+##  Top-K Sparse Attention (TKSA)
+class E_MHSA_2(nn.Module):
+    def __init__(self, dim, num_heads=8, bias=False):
+        super(E_MHSA_2, self).__init__()
+        self.num_heads = num_heads
+
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
+        self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1, padding=1, groups=dim * 3, bias=bias)
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.attn_drop = nn.Dropout(0.)
+
+        self.attn1 = torch.nn.Parameter(torch.tensor([0.2]), requires_grad=True)
+        self.attn2 = torch.nn.Parameter(torch.tensor([0.2]), requires_grad=True)
+        self.attn3 = torch.nn.Parameter(torch.tensor([0.2]), requires_grad=True)
+        self.attn4 = torch.nn.Parameter(torch.tensor([0.2]), requires_grad=True)
+
+    def forward(self, x):
+        re = x
+        b, c, h, w = x.shape
+
+        qkv = self.qkv_dwconv(self.qkv(x))
+        q, k, v = qkv.chunk(3, dim=1)
+
+        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+
+        _, _, C, _ = q.shape
+
+        mask1 = torch.zeros(b, self.num_heads, C, C, device=x.device, requires_grad=False)
+        mask2 = torch.zeros(b, self.num_heads, C, C, device=x.device, requires_grad=False)
+        mask3 = torch.zeros(b, self.num_heads, C, C, device=x.device, requires_grad=False)
+        mask4 = torch.zeros(b, self.num_heads, C, C, device=x.device, requires_grad=False)
+
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+
+        index = torch.topk(attn, k=int(C / 2), dim=-1, largest=True)[1]
+        mask1.scatter_(-1, index, 1.)
+        attn1 = torch.where(mask1 > 0, attn, torch.full_like(attn, float('-inf')))
+
+        index = torch.topk(attn, k=int(C * 2 / 3), dim=-1, largest=True)[1]
+        mask2.scatter_(-1, index, 1.)
+        attn2 = torch.where(mask2 > 0, attn, torch.full_like(attn, float('-inf')))
+
+        index = torch.topk(attn, k=int(C * 3 / 4), dim=-1, largest=True)[1]
+        mask3.scatter_(-1, index, 1.)
+        attn3 = torch.where(mask3 > 0, attn, torch.full_like(attn, float('-inf')))
+
+        index = torch.topk(attn, k=int(C * 4 / 5), dim=-1, largest=True)[1]
+        mask4.scatter_(-1, index, 1.)
+        attn4 = torch.where(mask4 > 0, attn, torch.full_like(attn, float('-inf')))
+
+        attn1 = attn1.softmax(dim=-1)
+        attn2 = attn2.softmax(dim=-1)
+        attn3 = attn3.softmax(dim=-1)
+        attn4 = attn4.softmax(dim=-1)
+
+        out1 = (attn1 @ v)
+        out2 = (attn2 @ v)
+        out3 = (attn3 @ v)
+        out4 = (attn4 @ v)
+
+        out = out1 * self.attn1 + out2 * self.attn2 + out3 * self.attn3 + out4 * self.attn4
+
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+
+        out = self.project_out(out)
+        out = out + re
+        return out
+
+
+class NTB(nn.Module):
+    """
+    Next-Transposed Convolution Block (NTB)
+    Parameters
+    ----------
+    in_channel : int
+        Number of input channels.
+    out_channel : int
+        Number of output channels.
+    shrink_ratio: int
+        Shrink ratio of the channel rection.
+    """
+    def __init__(self, in_channel, out_channel, shrink_ratio = 0.75, spatial_reduction_ratio = 1):
+        super().__init__()
+        first_part_dim = int(out_channel * shrink_ratio)
+        second_part_dim = out_channel - first_part_dim
+        self.point_conv1 = nn.Conv2d(in_channel, first_part_dim, kernel_size = 1)
+        self.point_conv2 = nn.Conv2d(first_part_dim, second_part_dim, kernel_size = 1)
+
+        # self.e_mhsa = E_MHSA(first_part_dim, stride=spatial_reduction_ratio)
+        self.e_mhsa = E_MHSA_2(first_part_dim)
+        self.mhca = MHCA(second_part_dim)
+        self.mlp = Mlp(out_channel, out_channel, expansion_ratio = 2)
+
+    def forward(self, x):
+        x = self.point_conv1(x)
+        first_part = self.e_mhsa(x) + x
+
+        seconf_part = self.point_conv2(first_part)
+        seconf_part = self.mhca(seconf_part) + seconf_part
+
+        result = torch.cat([first_part, seconf_part], dim=1)
+        result = self.mlp(result) + result
+        return result
+
+
+class PatchEmbed(nn.Module):
+    """
+    Patch Embedding (PE)
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    out_channels : int
+        Number of output channels.
+    """
+    def __init__(self, in_channels, out_channels):
+        super(PatchEmbed, self).__init__()
+        self.avgpool = nn.AvgPool2d(kernel_size = 2, stride = 2)
+        self.conv = nn.Conv2d(in_channels, out_channels, 1)
+
+    def forward(self, x):
+        return self.conv(self.avgpool(x))
+
+
+class Stem(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(Stem, self).__init__()
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=4)
+
+    def forward(self, x):
+        x = self.proj(x)
+        return x
+#
+# class Stem(nn.Module):
+#
+#     def __init__(self, in_channels, out_channels):
+#         super(Stem, self).__init__()
+#         self.conv1 = Conv3x3(in_channels, 64, stride=2)
+#         self.conv2 = Conv3x3(64, 32, stride=1)
+#         self.conv3 = Conv3x3(32, 64, stride=1)
+#         self.conv4 = Conv3x3(64, out_channels, stride=1)
+#
+#     def forward(self, x):
+#         return self.conv4(self.conv3(self.conv2(self.conv1(x))))
+
+
+class Block(nn.Module):
+    def __init__(self, in_channels, out_channels, ncb_layers, nct_layers, repeat, spatial_reduction_ratio = 1):
+        super(Block, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.ncb_layers = ncb_layers
+        self.nct_layers = nct_layers
+        self.repeat = repeat
+        self.spatial_reduction_ratio = spatial_reduction_ratio
+
+        block = []
+        for num in range(repeat):
+            if num != repeat - 1:
+                block += self._make_layer(self.in_channels, self.in_channels,
+                                          self.ncb_layers, self.nct_layers)
+            else:
+                block += self._make_layer(self.in_channels, self.out_channels,
+                                          self.ncb_layers, self.nct_layers)
+        self.block = nn.Sequential(*block)
+
+    def _make_layer(self, in_channels, out_channels, ncb_layers, nct_layers):
+        self.sub_layers = []
+        for _ in range(ncb_layers):
+            self.sub_layers += [NCB(in_channels, )]
+        for _ in range(nct_layers):
+            self.sub_layers += [NTB(in_channels, out_channels, spatial_reduction_ratio=self.spatial_reduction_ratio)]
+        return nn.Sequential(*self.sub_layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+# if __name__ == "__main__":
+#     x = torch.randn(1, 256, 16, 16)
+#     x_input = torch.randn(1, 3, 256, 256)
+#
+#     stem = Stem(3, 64)
+#     patch_embed = PatchEmbed(256, 384)
+#     ncb = NCB(256)
+#     ntb = NTB(256, 384)
+#     block = Block(256, 384, 4, 1, 6)
+#
+#     stem_x = stem(x_input)
+#     patch_x = patch_embed(x)
+#     ncb_x = ncb(x)
+#     ntb_x = ntb(ncb_x)
+#     block_x = block(x)
+#
+#     print(f"stem_x: {stem_x.shape}")  # [1, 64, 16, 16]
+#     print(f"patch_x.shape: {patch_x.shape}")  # [1, 384, 32, 32]
+#     print(f"ncb_x.shape: {ncb_x.shape}")  # [1, 256, 64, 64]
+#     print(f"ntb_x.shape: {ntb_x.shape}")  # [1, 256, 64, 64]
+#     print(f"block_x.shape: {block_x.shape}")  # [1, 384, 16, 16]
